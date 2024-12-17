@@ -2,8 +2,8 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define UNUSED(VAR) (void)(VAR)
+#include <stdbool.h>
+#include <limits.h>
 
 typedef struct StackNode
 {
@@ -20,7 +20,7 @@ typedef struct StackEntry
     st_node_t* top_node_p;
         // Pointer to the top (last) node in stack
     unsigned int size;
-    int is_used;
+    bool is_used;
 } st_entry_t;
 
 typedef struct StackList
@@ -33,13 +33,10 @@ typedef struct StackList
     int first_free_handler;
 } st_list_t;
 
-int handler_valid_range(const hstack_t hstack);
 st_node_t* delete_stack_node(st_node_t* node_p);
 
 st_list_t g_stack_list = {.items_p = NULL, .capacity = 0,
                           .items_counter = 0, .first_free_handler = 0};
-    // FIXME: Where should structs and corresponding types be defined?
-    //        In cstack.c (as implemented) or in cstack.h?
 
 hstack_t stack_new(void)
 {
@@ -47,11 +44,23 @@ hstack_t stack_new(void)
     {
         // List is full, expand the list
 
-        int new_capacity = (g_stack_list.capacity == 0)
-                                    ? 4 : (g_stack_list.capacity * 2);
-            // TODO: I could check for arithmetic overflow for new_capacity
-            // but it's unlikely someone would need more than ~2 billion (INT_MAX)
-            // stacks at once (it takes 30 list expansions to overflow)
+        int new_capacity;
+        switch (g_stack_list.capacity)
+        {
+            case INT_MAX:
+                // Cannot expand the list any longer
+                return -1;
+            case INT_MAX / 2:
+                // Simple x2 would get us INT_MAX + 1
+                new_capacity = INT_MAX;
+                break;
+            case 0:
+                new_capacity = 4;
+                break;
+            default:
+                new_capacity = g_stack_list.capacity * 2;
+                break;
+        }
 
         st_entry_t* new_items_p = realloc(g_stack_list.items_p,
                             sizeof(st_entry_t) * new_capacity);
@@ -63,7 +72,7 @@ hstack_t stack_new(void)
         // Assign correct values to new StackEntry elements
         for (int i = g_stack_list.capacity; i < new_capacity; i++)
             g_stack_list.items_p[i] = (st_entry_t) {.top_node_p = NULL,
-                                                    .size = 0u, .is_used = 0};
+                                                    .size = 0u, .is_used = false};
 
         g_stack_list.first_free_handler = g_stack_list.capacity;
         g_stack_list.capacity = new_capacity;
@@ -75,14 +84,14 @@ hstack_t stack_new(void)
             g_stack_list.first_free_handler++;
     }
 
-    g_stack_list.items_p[g_stack_list.first_free_handler].is_used = 1;
+    g_stack_list.items_p[g_stack_list.first_free_handler].is_used = true;
     g_stack_list.items_counter++;
     return g_stack_list.first_free_handler++;
 }
 
 void stack_free(const hstack_t hstack)
 {
-    if (!handler_valid_range(hstack) || !g_stack_list.items_p[hstack].is_used)
+    if (stack_valid_handler(hstack))
         return;
 
     while (g_stack_list.items_p[hstack].top_node_p != NULL)
@@ -91,7 +100,7 @@ void stack_free(const hstack_t hstack)
                                                                   top_node_p);
 
     g_stack_list.items_p[hstack].size = 0;
-    g_stack_list.items_p[hstack].is_used = 0;
+    g_stack_list.items_p[hstack].is_used = false;
     g_stack_list.items_counter--;
 
     if (g_stack_list.items_counter == 0)
@@ -101,20 +110,22 @@ void stack_free(const hstack_t hstack)
         g_stack_list.capacity = 0;
         g_stack_list.first_free_handler = 0;
     }
+    else if (hstack < g_stack_list.first_free_handler)
+        g_stack_list.first_free_handler = hstack;
 }
 
 int stack_valid_handler(const hstack_t hstack)
 {
-    if (handler_valid_range(hstack) && g_stack_list.items_p[hstack].is_used)
-        return 0;
-
-    return 1;
+    // NB! 1 and 0 return codes are used in in contrast to the usual sense
+    if (hstack < 0 || hstack >= g_stack_list.capacity ||
+        !g_stack_list.items_p[hstack].is_used)
+        return 1;
+    return 0;
 }
 
 unsigned int stack_size(const hstack_t hstack)
 {
-    if (handler_valid_range(hstack))
-        // Omitted explicit is_used check, should not cause any trouble
+    if (!stack_valid_handler(hstack))
         return g_stack_list.items_p[hstack].size;
 
     return 0u;
@@ -122,13 +133,12 @@ unsigned int stack_size(const hstack_t hstack)
 
 void stack_push(const hstack_t hstack, const void* data_in, const unsigned int size)
 {
-    if (!handler_valid_range(hstack) || !g_stack_list.items_p[hstack].is_used ||
-        data_in == NULL || size == 0u)
+    if (stack_valid_handler(hstack) || data_in == NULL || size == 0u)
         return;
 
     st_node_t* new_node_p = malloc(sizeof(st_node_t) + sizeof(unsigned char) * size);
     if (new_node_p == NULL)
-        // Stack overflow, could not allocate any more memory
+        // OOM, could not allocate any more memory
         return;
 
     new_node_p->prev_node_p = g_stack_list.items_p[hstack].top_node_p;
@@ -141,9 +151,8 @@ void stack_push(const hstack_t hstack, const void* data_in, const unsigned int s
 
 unsigned int stack_pop(const hstack_t hstack, void* data_out, const unsigned int size)
 {
-    if (!handler_valid_range(hstack) || !g_stack_list.items_p[hstack].is_used ||
-        g_stack_list.items_p[hstack].size == 0 || data_out == NULL ||
-        size < g_stack_list.items_p[hstack].top_node_p->data_length)
+    if (stack_valid_handler(hstack) || g_stack_list.items_p[hstack].size == 0 ||
+        data_out == NULL || size < g_stack_list.items_p[hstack].top_node_p->data_length)
         return 0u;
 
     unsigned int data_length = g_stack_list.items_p[hstack].
@@ -156,14 +165,6 @@ unsigned int stack_pop(const hstack_t hstack, void* data_out, const unsigned int
     g_stack_list.items_p[hstack].size--;
 
     return data_length;
-}
-
-int handler_valid_range(const hstack_t hstack)
-{
-    if (hstack < 0 || hstack >= g_stack_list.capacity)
-        // Handler out of range
-        return 0;
-    return 1;
 }
 
 st_node_t* delete_stack_node(st_node_t* node_p)
